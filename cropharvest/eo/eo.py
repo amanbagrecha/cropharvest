@@ -1,7 +1,8 @@
-from pathlib import Path
-import geopandas
+import math
+import os
+import numpy as np
 import pandas as pd
-from tqdm import tqdm
+import rasterio
 from datetime import timedelta, date
 
 try:
@@ -23,92 +24,26 @@ from .srtm import get_single_image as get_single_srtm_image
 
 from .utils import make_combine_bands_function
 from cropharvest.bands import DYNAMIC_BANDS
-from cropharvest.utils import DATAFOLDER_PATH, memoized
 from cropharvest.countries import BBox
 from cropharvest.config import (
-    EXPORT_END_DAY,
-    EXPORT_END_MONTH,
+
     DAYS_PER_TIMESTEP,
-    DEFAULT_NUM_TIMESTEPS,
-    LABELS_FILENAME,
-    TEST_REGIONS,
 )
-from cropharvest.columns import RequiredColumns
 
-from typing import Dict, Union, List, Optional, Tuple
+from typing import Dict, List, Optional
 
-try:
-    from google.cloud import storage
-
-    GOOGLE_CLOUD_STORAGE_INSTALLED = True
-except ModuleNotFoundError:
-    GOOGLE_CLOUD_STORAGE_INSTALLED = False
-INSTALL_MSG = "Please install the google-cloud-storage library (pip install google-cloud-storage)"
 
 DYNAMIC_IMAGE_FUNCTIONS = [get_single_s2_image, get_single_era5_image]
 STATIC_IMAGE_FUNCTIONS = [get_single_srtm_image]
 
 
-@memoized
-def get_ee_task_list(key: str = "description") -> List[str]:
-    """Gets a list of all active tasks in the EE task list."""
-    task_list = ee.data.getTaskList()
-    return [
-        task[key]
-        for task in tqdm(task_list, desc="Loading Earth Engine tasks")
-        if task["state"] in ["READY", "RUNNING", "FAILED"]
-    ]
-
-
-@memoized
-def get_cloud_tif_list(dest_bucket: str) -> List[str]:
-    """Gets a list of all cloud-free TIFs in a bucket."""
-    if not GOOGLE_CLOUD_STORAGE_INSTALLED:
-        # Added as precaution, but should never happen
-        raise ValueError(f"{INSTALL_MSG} to enable GCP checks")
-
-    client = storage.Client()
-    cloud_tif_list_iterator = client.list_blobs(dest_bucket, prefix="tifs")
-    cloud_tif_list = [
-        blob.name
-        for blob in tqdm(cloud_tif_list_iterator, desc="Loading tifs already on Google Cloud")
-    ]
-    return cloud_tif_list
-
-
-class EarthEngineExporter:
-    """
-    Export satellite data from Earth engine. It's called using the following
-    script:
-    ```
-    from cropharvest.eo import EarthEngineExporter
-
-    exporter = EarthEngineExporter()
-    exporter.export_for_labels()
-    ```
-    :param labels: A geopandas.GeoDataFrame containing the labels for the exports
-    :param check_ee: Whether to check Earth Engine before exporting
-    :param check_gcp: Whether to check Google Cloud Storage before exporting,
-        google-cloud-storage must be installed.
-    :param credentials: The credentials to use for the export. If not specified,
-        the default credentials will be used
-    :param dest_bucket: The bucket to export to, google-cloud-storage must be installed.
-    """
-
+class LocalDiskExporter:
     output_folder_name = "eo_data"
-    test_output_folder_name = "test_eo_data"
 
     def __init__(
         self,
-        check_ee: bool = False,
-        check_gcp: bool = False,
         credentials: Optional[str] = None,
-        dest_bucket: Optional[str] = None,
     ) -> None:
-        # allows for easy checkpointing
-        self.cur_output_folder = f"{self.output_folder_name}_{str(date.today()).replace('-', '')}"
-
-        self.dest_bucket = dest_bucket
 
         try:
             if credentials:
@@ -118,167 +53,18 @@ class EarthEngineExporter:
         except Exception:
             print("This code doesn't work unless you have authenticated your earthengine account")
 
-        self.check_ee = check_ee
-        self.ee_task_list = get_ee_task_list() if self.check_ee else []
-
-        if check_gcp and dest_bucket is None:
-            raise ValueError("check_gcp was set to True but dest_bucket was not specified")
-        elif not GOOGLE_CLOUD_STORAGE_INSTALLED:
-            if check_gcp:
-                raise ValueError(f"{INSTALL_MSG} to enable GCP checks")
-            elif dest_bucket is not None:
-                raise ValueError(f"{INSTALL_MSG} to enable export to destination bucket")
-
-        self.check_gcp = check_gcp
-        self.cloud_tif_list = get_cloud_tif_list(dest_bucket) if self.check_gcp else []
-
-    @staticmethod
-    def load_default_labels(
-        dataset: Optional[str], start_from_last, checkpoint: Optional[Path]
-    ) -> geopandas.GeoDataFrame:
-        labels = geopandas.read_file(DATAFOLDER_PATH / LABELS_FILENAME)
-        export_end_year = pd.to_datetime(labels[RequiredColumns.EXPORT_END_DATE]).dt.year
-        labels["end_date"] = export_end_year.apply(
-            lambda x: date(x, EXPORT_END_MONTH, EXPORT_END_DAY)
-        )
-        labels = labels.assign(
-            start_date=lambda x: x["end_date"]
-            - timedelta(days=DAYS_PER_TIMESTEP * DEFAULT_NUM_TIMESTEPS)
-        )
-        labels["export_identifier"] = labels.apply(
-            lambda x: f"{x['index']}-{x[RequiredColumns.DATASET]}", axis=1
-        )
-        if dataset:
-            labels = labels[labels.dataset == dataset]
-
-        if start_from_last:
-            labels = EarthEngineExporter._filter_labels(labels, checkpoint)
-
-        return labels
-
-    @staticmethod
-    def _filter_labels(
-        labels: geopandas.GeoDataFrame, checkpoint: Optional[Path]
-    ) -> geopandas.GeoDataFrame:
-        # does not sort
-        datasets = labels.dataset.unique()
-
-        if checkpoint is None:
-            # if we have no checkpoint folder, then we have no
-            # downloaded files to check against
-            return labels
-
-        if len(list(checkpoint.glob(f"*{datasets[0]}*"))) == 0:
-            # no files downloaded
-            return labels
-
-        for idx in range(len(datasets)):
-            cur_dataset_files = list(checkpoint.glob(f"*{datasets[idx]}*"))
-            does_cur_exist = len(cur_dataset_files) > 0
-            if idx < (len(datasets) - 1):
-                does_next_exist = len(list(checkpoint.glob(f"*{datasets[idx + 1]}*"))) > 0
-            else:
-                # we are on the last dataset
-                does_next_exist = False
-            if does_next_exist & does_cur_exist:
-                continue
-            elif (not does_cur_exist) & does_next_exist:
-                raise RuntimeError("Datasets seem to be downloaded in the wrong order!")
-
-            # does_next doesn't exist, and does_cur does exist. We want to find the largest
-            # int downloaded
-            max_index = max([int(x.name.split("-")[0]) for x in cur_dataset_files])
-
-            row = labels[
-                ((labels.dataset == datasets[idx]) & (labels["index"] == max_index))
-            ].iloc[0]
-            # + 1 - non inclusive
-            labels = labels.loc[row.name + 1 :]
-
-            starting_row = labels.iloc[0]
-            print(f"Starting export from {starting_row.dataset} at index {starting_row['index']}")
-            return labels
-        return labels
-
-    def _export(
-        self,
-        image: ee.Image,
-        region: ee.Geometry,
-        filename: str,
-        description: str,
-        drive_folder: Optional[str] = None,
-        dest_bucket: Optional[str] = None,
-        file_dimensions: Optional[int] = None,
-        test: bool = False,
-    ) -> ee.batch.Export:
-        kwargs = dict(
-            image=image.clip(region),
-            description=description[:100],
-            scale=10,
-            region=region,
-            maxPixels=1e13,
-            fileDimensions=file_dimensions,
-        )
-
-        if dest_bucket:
-            if not GOOGLE_CLOUD_STORAGE_INSTALLED:
-                # Added as precaution, but should never happen
-                raise ValueError(f"{INSTALL_MSG} to enable export to destination bucket")
-
-            if not test:
-                # If training data make sure it goes in the tifs folder
-                filename = f"tifs/{filename}"
-
-            task = ee.batch.Export.image.toCloudStorage(
-                bucket=dest_bucket, fileNamePrefix=filename, **kwargs
-            )
-        else:
-            task = ee.batch.Export.image.toDrive(
-                folder=drive_folder, fileNamePrefix=filename, **kwargs
-            )
-
-        try:
-            task.start()
-            self.ee_task_list.append(description)
-        except ee.ee_exception.EEException as e:
-            print(f"Task not started! Got exception {e}")
-            return task
-
-        return task
-
     def _export_for_polygon(
         self,
+        bbox,
         polygon: ee.Geometry.Polygon,
-        polygon_identifier: Union[int, str],
         start_date: date,
         end_date: date,
+        pixel_size,
+        crs,
+        file_name,
+        identifier,
         days_per_timestep: int = DAYS_PER_TIMESTEP,
-        checkpoint: Optional[Path] = None,
-        test: bool = False,
-        file_dimensions: Optional[int] = None,
     ) -> bool:
-        filename = str(polygon_identifier)
-        if (checkpoint is not None) and (checkpoint / f"{filename}.tif").exists():
-            print("File already exists! Skipping")
-            return False
-
-        # Description of the export cannot contain certrain characters
-        description = filename.replace(".", "-").replace("=", "-").replace("/", "-")[:100]
-
-        if self.check_gcp:
-            # If test data we check the root in the cloud bucket
-            if test and f"{filename}.tif" in self.cloud_tif_list:
-                return False
-            # If training data we check the tifs folder in thee cloud bucket
-            elif not test and (f"tifs/{filename}.tif" in self.cloud_tif_list):
-                return False
-
-        # Check if task is already started in EarthEngine
-        if self.check_ee and (description in self.ee_task_list):
-            return True
-
-        if self.check_ee and len(self.ee_task_list) >= 3000:
-            return False
 
         image_collection_list: List[ee.Image] = []
         cur_date = start_date
@@ -323,171 +109,125 @@ class EarthEngineExporter:
 
         img = ee.Image.cat(total_image_list)
 
-        # and finally, export the image
-        kwargs = dict(
-            image=img,
-            region=polygon,
-            filename=filename,
-            description=description,
-            file_dimensions=file_dimensions,
-            test=test,
-        )
-        if self.dest_bucket:
-            kwargs["dest_bucket"] = self.dest_bucket
-        elif test:
-            kwargs["drive_folder"] = self.test_output_folder_name
-        else:
-            kwargs["drive_folder"] = self.cur_output_folder
 
-        self._export(**kwargs)
+        input_bands = img.bandNames().getInfo()
+        df = self.create_df(img, polygon, pixel_size=pixel_size, crs="EPSG:4326")
+        # len_x , len_y = self.generate_pts(bbox, pixel_size)
+        side_shape = df.shape[0]
+        
+        data_matrix = np.array(df.loc[:, input_bands].values)
+        # .reshape(
+            # side_shape, side_shape, len(input_bands)
+        # )
+        data_matrix = np.flip(data_matrix, axis=0)
+        transform = rasterio.transform.from_origin(
+            bbox.min_lon, bbox.max_lat, pixel_size, pixel_size
+        )
+
+        self.save_tif(f"{file_name}_{identifier}", data_matrix, transform, crs)
+        print(f"file saved as {file_name}_{identifier}.tif")
         return True
 
-    @classmethod
-    def _labels_to_polygons_and_years(
-        cls, labels: geopandas.GeoDataFrame, surrounding_metres: int
-    ) -> List[Tuple[ee.Geometry.Polygon, str, date, date]]:
-        output: List[ee.Geometry.Polygon] = []
+    def create_df(self, img_col, feature, pixel_size, crs):
+        imgcol = ee.ImageCollection(img_col)
+        polygon = ee.FeatureCollection(feature).geometry()
+        df = pd.DataFrame(imgcol.getRegion(polygon, pixel_size, crs).getInfo())
+        df, df.columns = df[1:], df.iloc[0]
+        df = df.drop(["id", "time"], axis=1)
 
-        print(f"Exporting {len(labels)} labels")
+        return df
 
-        for _, row in tqdm(labels.iterrows()):
-            ee_bbox = EEBoundingBox.from_centre(
-                mid_lat=row[RequiredColumns.LAT],
-                mid_lon=row[RequiredColumns.LON],
-                surrounding_metres=surrounding_metres,
-            )
+    def generate_pts(self, bbox, pixel_size):
+        x_pt = ee.List.sequence(bbox.min_lon, bbox.max_lon, pixel_size)
+        y_pt = ee.List.sequence(bbox.min_lat, bbox.max_lat, pixel_size)
 
-            try:
-                export_identifier = row["export_identifier"]
-            except KeyError:
-                export_identifier = cls.make_identifier(
-                    ee_bbox, row["start_date"], row["end_date"]
-                )
+        return len(x_pt.getInfo()), len(y_pt.getInfo())
 
-            output.append(
-                (
-                    ee_bbox.to_ee_polygon(),
-                    export_identifier,
-                    row["start_date"],
-                    row["end_date"],
-                )
-            )
+    def save_tif(self,file_name, data_array, transform, crs):
+        
 
-        return output
+        options = {
+            "driver": "Gtiff",
+            "height": data_array.shape[0],
+            "width": data_array.shape[1],
+            "count": 1,
+            "dtype": np.float32,
+            "crs": crs,
+            "transform": transform,
+        }
+        with rasterio.open(f"{file_name}.tif", "w", **options) as src:
+            src.write(data_array,1)
+            # for band in range(count):
+                # src.write(data_array[:, :, band], band + 1)
 
-    @staticmethod
-    def make_identifier(bbox: BBox, start_date, end_date) -> str:
-        # Identifier is rounded to the nearest ~10m
-        min_lon = round(bbox.min_lon, 4)
-        min_lat = round(bbox.min_lat, 4)
-        max_lon = round(bbox.max_lon, 4)
-        max_lat = round(bbox.max_lat, 4)
-        return (
-            f"min_lat={min_lat}_min_lon={min_lon}_max_lat={max_lat}_max_lon={max_lon}_"
-            f"dates={start_date}_{end_date}_all"
-        )
-
-    def export_for_test(
-        self,
-        padding_metres: int = 160,
-        checkpoint: Optional[Path] = None,
-    ) -> None:
-        for identifier, bbox in TEST_REGIONS.items():
-            polygon = EEBoundingBox.from_bounding_box(
-                bounding_box=bbox, padding_metres=padding_metres
-            ).to_ee_polygon()
-            _, _, year, _ = identifier.split("_")
-            end_date = date(int(year), EXPORT_END_MONTH, EXPORT_END_DAY)
-            start_date = end_date - timedelta(days=DAYS_PER_TIMESTEP * DEFAULT_NUM_TIMESTEPS)
-            _ = self._export_for_polygon(
-                polygon=polygon,
-                polygon_identifier=identifier,
-                start_date=start_date,
-                end_date=end_date,
-                checkpoint=checkpoint,
-                test=True,
-            )
+        return True
 
     def export_for_bbox(
         self,
         bbox: BBox,
-        bbox_name: str,
         start_date: date,
         end_date: date,
-        metres_per_polygon: Optional[int] = 10000,
-        file_dimensions: Optional[int] = None,
+        pixel_size,
+        file_name,
+        metres_per_polygon: Optional[int] = 500,
     ) -> Dict[str, bool]:
         if start_date > end_date:
             raise ValueError(f"Start date {start_date} is after end date {end_date}")
 
         ee_bbox = EEBoundingBox.from_bounding_box(bounding_box=bbox, padding_metres=0)
+
         if metres_per_polygon is not None:
             regions = ee_bbox.to_polygons(metres_per_patch=metres_per_polygon)
-            ids = [f"batch_{i}/{i}" for i in range(len(regions))]
+            ids = [f"batch_{i}_{i}" for i in range(len(regions))]
         else:
             regions = [ee_bbox.to_ee_polygon()]
-            ids = ["batch/0"]
+            ids = ["batch_0"]
+
+        import pyproj
+        from pyproj import Transformer
+
+        def latlon_to_utm_zone(lat, lon):
+            """
+            Calculate the UTM zone for the given latitude and longitude.
+            Returns UTM zone number and hemisphere (N or S).
+            """
+            zone_number = math.floor((lon + 180) / 6) + 1
+            hemisphere = "N" if lat >= 0 else "S"
+            return zone_number, hemisphere
+
+        def latlon_to_utm_crs(lat, lon):
+            """
+            Convert latitude and longitude to UTM CRS.
+            Returns the pyproj CRS object.
+            """
+            zone_number, hemisphere = latlon_to_utm_zone(lat, lon)
+            utm_crs = pyproj.CRS(
+                f"EPSG:326{zone_number}" if hemisphere == "N" else f"EPSG:327{zone_number}"
+            )
+            return utm_crs
+
+        lon = sum(bbox[::2]) / 2
+        lat = sum(bbox[1::2]) / 2
+        # Convert to UTM CRS
+        utm_crs = latlon_to_utm_crs(lat, lon)
+
+        transformer = Transformer.from_crs("EPSG:4326", utm_crs)
+        # Convert the bounding box coordinates
+        minx, miny = transformer.transform(bbox[1], bbox[0])
+        maxx, maxy = transformer.transform(bbox[3], bbox[2])
+
+        bbox_proj = BBox(min_lon=minx, min_lat=miny, max_lon=maxx, max_lat=maxy)
 
         return_obj = {}
         for identifier, region in zip(ids, regions):
             return_obj[identifier] = self._export_for_polygon(
+                bbox=bbox_proj,
                 polygon=region,
-                polygon_identifier=f"{bbox_name}/{identifier}",
                 start_date=start_date,
                 end_date=end_date,
-                file_dimensions=file_dimensions,
-                test=True,
+                pixel_size=pixel_size,
+                crs=utm_crs,
+                file_name=file_name,
+                identifier=identifier
             )
         return return_obj
-
-    def export_for_labels(
-        self,
-        labels: Optional[geopandas.GeoDataFrame] = None,
-        dataset: Optional[str] = None,
-        num_labelled_points: Optional[int] = 3000,
-        surrounding_metres: int = 80,
-        checkpoint: Optional[Path] = None,
-        start_from_last: bool = False,
-    ) -> None:
-        if labels is None:
-            labels = self.load_default_labels(
-                dataset=dataset, start_from_last=start_from_last, checkpoint=checkpoint
-            )
-        else:
-            if dataset is not None:
-                print("No dataset can be specified if passing a different set of labels")
-            if start_from_last:
-                print("start_from_last cannot be used if passing a different set of labels")
-
-        for expected_column in [
-            "start_date",
-            "end_date",
-            RequiredColumns.LAT,
-            RequiredColumns.LON,
-        ]:
-            assert expected_column in labels
-        if "export_identifier" not in labels:
-            print("No explicit export_identifier in labels. One will be constructed during export")
-
-        polygons_to_download = self._labels_to_polygons_and_years(
-            labels=labels,
-            surrounding_metres=surrounding_metres,
-        )
-
-        exports_started = 0
-        for polygon, identifier, start_date, end_date in tqdm(
-            polygons_to_download, desc="Exporting:"
-        ):
-            export_started = self._export_for_polygon(
-                polygon=polygon,
-                polygon_identifier=identifier,
-                start_date=start_date,
-                end_date=end_date,
-                checkpoint=checkpoint,
-                test=False,
-            )
-            if export_started:
-                exports_started += 1
-                if num_labelled_points is not None and exports_started >= num_labelled_points:
-                    print(f"Started {exports_started} exports. Ending export")
-                    return None

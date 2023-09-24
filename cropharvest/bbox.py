@@ -73,3 +73,7 @@ class BBox:
             max_lat=max([self.max_lat, other_box.max_lat]),
             name="_".join([x for x in [self.name, other_box.name] if x is not None]),
         )
+
+    def __getitem__(self, index):
+        bbox = [self.min_lon, self.min_lat, self.max_lon, self.max_lat]
+        return bbox[index]

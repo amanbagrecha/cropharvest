@@ -1,4 +1,4 @@
-from .eo import EarthEngineExporter
+from .eo import LocalDiskExporter
 
 
-__all__ = ["EarthEngineExporter"]
+__all__ = ["LocalDiskExporter"]
